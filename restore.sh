@@ -1,11 +1,12 @@
 #!/bin/bash
 
 # Script de restore pentru sistemul de backup
-# Autor: [Numele tău]
-# Data: $(date +%Y-%m-%d)
+
 
 # Încărcare configurație
-CONFIG_FILE="config.conf"
+SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
+CONFIG_FILE="$SCRIPT_DIR/config.conf"
+
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "Eroare: Fișierul de configurație $CONFIG_FILE nu a fost găsit!"
     exit 1
@@ -30,6 +31,7 @@ show_usage() {
     echo "  -d, --destination DIR   Directorul destinație pentru restore"
     echo "  -f, --file FILE         Restaurează doar fișierul specificat"
     echo "  -v, --verify BACKUP     Verifică integritatea backup-ului"
+    echo "  --list-files BACKUP     Listează fișierele dintr-un backup"
     echo "  -h, --help              Afișează acest mesaj"
     echo ""
     echo "Exemple:"
@@ -52,9 +54,10 @@ list_backups() {
             local backup_name=$(basename "$backup_dir")
             local backup_date=$(echo "$backup_name" | sed 's/backup_//' | sed 's/_/ /')
             local file_count=0
-            if [ -f "$backup_dir/metadata.txt" ]; then
-                file_count=$(wc -l < "$backup_dir/metadata.txt")
+            if [ -f "$backup_dir/metadata.csv" ]; then
+                file_count=$(($(wc -l < "$backup_dir/metadata.csv") - 1))
             fi
+
             echo "  $backup_name (Data: $backup_date, Fișiere: $file_count)"
         fi
     done
@@ -132,33 +135,32 @@ extract_archive() {
 
 verify_backup() {
     local backup_dir="$1"
-    
+    local metadata_file="$backup_dir/metadata.csv"
+
     log_message "Verific integritatea backup-ului $backup_dir..."
-    
-    if [ ! -d "$backup_dir" ]; then
-        log_message "Eroare: Directorul backup nu există: $backup_dir"
+
+    if [ ! -f "$metadata_file" ]; then
+        log_message "Eroare: Fișierul metadata.csv nu există"
         return 1
     fi
-    
-    if [ ! -f "$backup_dir/checksums.txt" ]; then
-        log_message "Eroare: Fișierul de checksum nu există"
-        return 1
-    fi
-    
+
     local errors=0
     local total=0
-    
-    while IFS=':' read -r file_path expected_checksum; do
+
+    tail -n +2 "$metadata_file" | while IFS=';' read -r path checksum permissions owner mtime; do
+        # Ignoră linia de antet
+        [[ "$path" == "cale_relativa" ]] && continue
+
         ((total++))
-        local full_path="$backup_dir/data/$file_path"
-        
+        local full_path="$backup_dir/data/$path"
+
         if [ ! -f "$full_path" ]; then
-            log_message "Eroare: Fișierul lipsește: $file_path"
+            log_message "Eroare: Lipsește fișierul $path"
             ((errors++))
             continue
         fi
-        
-        local actual_checksum
+
+        local actual_checksum=""
         case "$CHECKSUM_TYPE" in
             "md5")
                 actual_checksum=$(md5sum "$full_path" 2>/dev/null | cut -d' ' -f1)
@@ -167,53 +169,96 @@ verify_backup() {
                 actual_checksum=$(sha256sum "$full_path" 2>/dev/null | cut -d' ' -f1)
                 ;;
         esac
-        
-        if [ "$actual_checksum" != "$expected_checksum" ]; then
-            log_message "Eroare checksum: $file_path"
+
+        if [ "$actual_checksum" != "$checksum" ]; then
+            log_message "Eroare checksum: $path"
             ((errors++))
         fi
-        
-    done < "$backup_dir/checksums.txt"
-    
+    done < <(tail -n +2 "$metadata_file")
+
     log_message "Verificare completă: $errors erori din $total fișiere"
-    
+
     if [ "$errors" -eq 0 ]; then
         log_message "Backup-ul este integru!"
+        echo "INTEGRU"
         return 0
     else
         log_message "Backup-ul are erori de integritate!"
+        echo "ERORI"
         return 1
     fi
+
 }
 
 restore_permissions() {
     local backup_dir="$1"
     local dest_dir="$2"
-    
-    if [ ! -f "$backup_dir/permissions.txt" ]; then
-        log_message "Avertisment: Nu s-a găsit fișierul de permisiuni"
-        return 0
+    local metadata_file="$backup_dir/metadata.csv"
+
+    log_message "Restabilesc permisiuni, owner și timpuri pentru fișiere..."
+
+    if [ ! -f "$metadata_file" ]; then
+        log_message "Eroare: Fișierul metadata.csv nu există"
+        return 1
     fi
-    
-    log_message "Restaurez permisiunile..."
-    
-    while IFS=':' read -r file_path permissions owner; do
-        local full_path="$dest_dir/$file_path"
-        
+
+    tail -n +2 "$metadata_file" | while IFS=';' read -r path checksum permissions owner mtime; do
+        local full_path="$dest_dir/$path"
+        local user_group=$(echo "$owner" | tr ':' ' ')
+
         if [ -f "$full_path" ]; then
-            # Restaurez permisiunile
             chmod "$permissions" "$full_path" 2>/dev/null
-            
-            # Restaurez owner-ul (doar dacă rulez ca root)
+
             if [ "$EUID" -eq 0 ]; then
-                chown "$owner" "$full_path" 2>/dev/null
+                chown $user_group "$full_path" 2>/dev/null
             fi
+
+            touch -d @"$mtime" "$full_path" 2>/dev/null
         fi
-        
-    done < "$backup_dir/permissions.txt"
-    
-    log_message "Permisiuni restaurate"
+    done
+
+    log_message "Restaurarea permisiunilor completă."
 }
+list_files() {
+    local backup_name="$1"
+    local backup_path="$BACKUP_DIR/$backup_name"
+    local temp_dir=""
+    local cleanup_temp=false
+
+    echo "🔍 Listăm fișierele din backup: $backup_name"
+
+    if [ -d "$backup_path" ]; then
+        :
+    elif [ -f "$backup_path.tar.gz" ]; then
+        temp_dir=$(mktemp -d)
+        cleanup_temp=true
+        extract_archive "$backup_path.tar.gz" "$temp_dir"
+        backup_path="$temp_dir/$backup_name"
+    elif [ -f "$backup_path.tar.gz.enc" ]; then
+        temp_dir=$(mktemp -d)
+        cleanup_temp=true
+        local temp_archive="$temp_dir/backup.tar.gz"
+        decrypt_backup "$backup_path.tar.gz.enc" "$temp_archive"
+        extract_archive "$temp_archive" "$temp_dir"
+        backup_path="$temp_dir/$backup_name"
+    else
+        echo "Eroare: Nu am găsit backup-ul $backup_name"
+        return 1
+    fi
+
+    if [ -d "$backup_path/data" ]; then
+        find "$backup_path/data" -type f | sed "s|$backup_path/data/||"
+    else
+        echo "Nu s-au găsit fișiere salvate în backup."
+        return 1
+    fi
+
+    # Cleanup
+    if [ "$cleanup_temp" = true ] && [ -n "$temp_dir" ]; then
+        rm -rf "$temp_dir"
+    fi
+}
+
 
 restore_backup() {
     local backup_name="$1"
@@ -266,18 +311,23 @@ restore_backup() {
     
     # Restaurează fișierele
     if [ -n "$specific_file" ]; then
-        # Restaurează doar fișierul specificat
-        local source_file="$backup_path/data/$specific_file"
-        local dest_file="$destination/$specific_file"
-        
-        if [ -f "$source_file" ]; then
-            mkdir -p "$(dirname "$dest_file")"
-            cp -p "$source_file" "$dest_file"
-            log_message "Restaurat fișier: $specific_file"
-        else
-            log_message "Eroare: Fișierul $specific_file nu există în backup"
-            return 1
-        fi
+    # Caută fișierul indiferent de subdirector
+    local source_file
+    source_file=$(find "$backup_path/data" -type f -name "$(basename "$specific_file")" | head -n 1)
+
+    if [ -n "$source_file" ] && [ -f "$source_file" ]; then
+        # Cale relativă pentru destinație
+        local relative_path=${source_file#"$backup_path/data/"}
+        local dest_file="$destination/$relative_path"
+
+        mkdir -p "$(dirname "$dest_file")"
+        cp -p "$source_file" "$dest_file"
+        log_message "Restaurat fișier: $relative_path"
+    else
+        log_message "Eroare: Fișierul $specific_file nu a fost găsit în backup"
+        return 1
+    fi
+
     else
         # Restaurează toate fișierele
         if [ -d "$backup_path/data" ]; then
@@ -331,6 +381,12 @@ while [[ $# -gt 0 ]]; do
             BACKUP_NAME="$2"
             shift 2
             ;;
+        --list-files)
+            ACTION="list-files"
+            BACKUP_NAME="$2"
+            shift 2
+            ;;
+  
         -h|--help)
             show_usage
             exit 0
@@ -356,20 +412,96 @@ case "$ACTION" in
         fi
         
         if [ -z "$DESTINATION" ]; then
-            DESTINATION="$SOURCE_DIR"
+            DESTINATION=$(zenity --file-selection --directory --title="Alege un director pentru restaurare completă")
+            if [ -z "$DESTINATION" ]; then
+                zenity --error --text="Nu ai selectat niciun director. Restaurarea a fost anulată."
+                exit 1
+            fi
         fi
+
         
         restore_backup "$BACKUP_NAME" "$DESTINATION" "$SPECIFIC_FILE"
         ;;
-    "verify")
+    
+        "verify")
+    if [ -z "$BACKUP_NAME" ]; then
+        echo "Eroare: Trebuie să specifici numele backup-ului pentru verificare"
+        show_usage
+        exit 1
+    fi
+
+    backup_path="$BACKUP_DIR/$BACKUP_NAME"
+    temp_dir=""
+    cleanup_temp=false
+
+    if [ -d "$backup_path" ]; then
+        :
+    elif [ -f "$backup_path.tar.gz" ]; then
+        temp_dir=$(mktemp -d)
+        cleanup_temp=true
+        extract_archive "$backup_path.tar.gz" "$temp_dir"
+
+        if [ -f "$temp_dir/metadata.csv" ] && [ -d "$temp_dir/data" ]; then
+            backup_path="$temp_dir"
+        else
+            subdir=$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            if [ -f "$subdir/metadata.csv" ] && [ -d "$subdir/data" ]; then
+                backup_path="$subdir"
+            else
+                log_message "Eroare: Structura backup-ului $BACKUP_NAME nu a fost recunoscută după extragere"
+                echo "::STATUS=ERROR"
+                exit 1
+            fi
+        fi
+
+    elif [ -f "$backup_path.tar.gz.enc" ]; then
+        temp_dir=$(mktemp -d)
+        cleanup_temp=true
+        temp_archive="$temp_dir/backup.tar.gz"
+        decrypt_backup "$backup_path.tar.gz.enc" "$temp_archive"
+        extract_archive "$temp_archive" "$temp_dir"
+
+        if [ -f "$temp_dir/metadata.csv" ] && [ -d "$temp_dir/data" ]; then
+            backup_path="$temp_dir"
+        else
+            subdir=$(find "$temp_dir" -mindepth 1 -maxdepth 1 -type d | head -n 1)
+            if [ -f "$subdir/metadata.csv" ] && [ -d "$subdir/data" ]; then
+                backup_path="$subdir"
+            else
+                log_message "Eroare: Structura backup-ului $BACKUP_NAME nu a fost recunoscută după decriptare"
+                echo "::STATUS=ERROR"
+                exit 1
+            fi
+        fi
+    else
+        log_message "Eroare: Backup-ul $BACKUP_NAME nu a fost găsit!"
+        echo "::STATUS=ERROR"
+        exit 1
+    fi
+
+    verify_backup "$backup_path"
+    result=$?
+
+    if [ "$cleanup_temp" = true ] && [ -n "$temp_dir" ]; then
+        rm -rf "$temp_dir"
+    fi
+
+    if [ "$result" -eq 0 ]; then
+        echo "::STATUS=OK"
+    else
+        echo "::STATUS=ERROR"
+    fi
+    ;;
+
+    "list-files")
         if [ -z "$BACKUP_NAME" ]; then
-            echo "Eroare: Trebuie să specifici numele backup-ului pentru verificare"
-            show_usage
+            echo "Eroare: Trebuie să specifici numele backup-ului pentru listare fișiere"
             exit 1
         fi
-        
-        verify_backup "$BACKUP_DIR/$BACKUP_NAME"
+        list_files "$BACKUP_NAME"
         ;;
+
+
     *)
         echo "Trebuie să specifici o acțiune!"
         show_usage

@@ -1,8 +1,7 @@
 #!/bin/bash
 
 # Sistem de backup incremental pentru Linux
-# Autor: [Numele tău]
-# Data: $(date +%Y-%m-%d)
+
 
 # Încărcare configurație
 CONFIG_FILE="config.conf"
@@ -18,26 +17,28 @@ SCRIPT_DIR=$(dirname "$(readlink -f "$0")")
 LOG_FILE="$BACKUP_DIR/backup.log"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 CURRENT_BACKUP="$BACKUP_DIR/backup_$TIMESTAMP"
-METADATA_FILE="$CURRENT_BACKUP/metadata.txt"
-CHECKSUM_FILE="$CURRENT_BACKUP/checksums.txt"
+METADATA_FILE="$CURRENT_BACKUP/metadata.csv"
 
 # Funcții utilitare
 log_message() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE"
 }
-
 create_backup_structure() {
     log_message "Creez structura de backup..."
     mkdir -p "$CURRENT_BACKUP"
     mkdir -p "$BACKUP_DIR"
     touch "$LOG_FILE"
-    touch "$METADATA_FILE"
-    touch "$CHECKSUM_FILE"
+
+    # Creez fișierul CSV cu antet
+    local metadata_csv="$CURRENT_BACKUP/metadata.csv"
+    echo "path;checksum;permissions;owner;mtime" > "$metadata_csv"
 }
 
+
 find_last_backup() {
-    LAST_BACKUP=$(find "$BACKUP_DIR" -maxdepth 1 -type d -name "backup_*" | sort | tail -2 | head -1)
-    if [ -n "$LAST_BACKUP" ] && [ "$LAST_BACKUP" != "$CURRENT_BACKUP" ]; then
+    # Exclud backup-ul curent din căutare
+    LAST_BACKUP=$(find "$BACKUP_DIR" -maxdepth 1 -type d -name "backup_*" ! -name "backup_$TIMESTAMP" | sort | tail -1)
+    if [ -n "$LAST_BACKUP" ] && [ -d "$LAST_BACKUP" ]; then
         log_message "Găsit backup anterior: $LAST_BACKUP"
         return 0
     else
@@ -45,7 +46,6 @@ find_last_backup() {
         return 1
     fi
 }
-
 calculate_checksum() {
     local file="$1"
     case "$CHECKSUM_TYPE" in
@@ -85,35 +85,90 @@ file_changed() {
         return 1  # Fișierul nu s-a modificat
     fi
 }
-
 backup_file() {
     local source_file="$1"
-    local relative_path=$(realpath --relative-to="$SOURCE_DIR" "$source_file")
+    local relative_path
+    relative_path=$(realpath --relative-to="$SOURCE_DIR" "$source_file")
     local backup_file="$CURRENT_BACKUP/data/$relative_path"
-    
+
     # Creez directorul dacă nu există
     mkdir -p "$(dirname "$backup_file")"
-    
+
     # Copiez fișierul păstrând atributele
     cp -p "$source_file" "$backup_file"
-    
-    # Salvez metadata
-    echo "$relative_path" >> "$METADATA_FILE"
-    
-    # Calculez și salvez checksum
-    local checksum=$(calculate_checksum "$source_file")
-    echo "$relative_path:$checksum" >> "$CHECKSUM_FILE"
-    
-    # Salvez permisiuni și owner
-    local permissions=$(stat -c "%a" "$source_file")
-    local owner=$(stat -c "%U:%G" "$source_file")
-    echo "$relative_path:$permissions:$owner" >> "$CURRENT_BACKUP/permissions.txt"
+
+    # Colectez toate metadatele necesare
+    local checksum
+    checksum=$(calculate_checksum "$source_file")
+
+    local permissions
+    permissions=$(stat -c "%a" "$source_file")
+
+    local owner
+    owner=$(stat -c "%U:%G" "$source_file")
+
+    local mtime
+    mtime=$(stat -c "%Y" "$source_file")
+
+    # Scriu într-un singur rând CSV
+    echo "$relative_path;$checksum;$permissions;$owner;$mtime" >> "$CURRENT_BACKUP/metadata.csv"
+
+}
+
+verify_backup() {
+    local backup_dir="$1"
+    local metadata_file="$backup_dir/metadata.csv"
+
+    log_message "Verific integritatea backup-ului $backup_dir..."
+
+    if [ ! -f "$metadata_file" ]; then
+        log_message "Eroare: Fișierul metadata.csv nu există"
+        return 1
+    fi
+
+    local errors=0
+    local total=0
+
+    tail -n +2 "$metadata_file" | while IFS=';' read -r path checksum permissions owner mtime; do
+        ((total++))
+        local full_path="$backup_dir/data/$path"
+
+        if [ ! -f "$full_path" ]; then
+            log_message "Eroare: Lipsește fișierul $path"
+            ((errors++))
+            continue
+        fi
+
+        local actual_checksum=""
+        case "$CHECKSUM_TYPE" in
+            "md5")
+                actual_checksum=$(md5sum "$full_path" 2>/dev/null | cut -d' ' -f1)
+                ;;
+            "sha256")
+                actual_checksum=$(sha256sum "$full_path" 2>/dev/null | cut -d' ' -f1)
+                ;;
+        esac
+
+        if [ "$actual_checksum" != "$checksum" ]; then
+            log_message "Eroare checksum: $path"
+            ((errors++))
+        fi
+    done
+
+    log_message "Verificare completă: $errors erori din $total fișiere"
+
+    if [ "$errors" -eq 0 ]; then
+        log_message "✅ Backup-ul este integru!"
+        return 0
+    else
+        log_message "❌ Backup-ul are erori de integritate!"
+        return 1
+    fi
 }
 
 perform_backup() {
     log_message "Încep procesul de backup..."
     
-    # Găsesc ultimul backup
     if find_last_backup; then
         INCREMENTAL=true
         log_message "Efectuez backup incremental"
@@ -121,14 +176,19 @@ perform_backup() {
         INCREMENTAL=false
         log_message "Efectuez backup complet"
     fi
-    
-    # Creez directorul pentru date
+
     mkdir -p "$CURRENT_BACKUP/data"
     
     local file_count=0
     local backed_up_count=0
-    
-    # Parcurg toate fișierele din SOURCE_DIR
+
+    #  Construiește lista de excluderi O DATĂ
+    EXCLUDE_ARGS=()
+    for pattern in $EXCLUDE_PATTERNS; do
+        EXCLUDE_ARGS+=( ! -name "$pattern" )
+    done
+
+    # Parcurg toate fișierele filtrate
     while IFS= read -r -d '' file; do
         ((file_count++))
         
@@ -139,16 +199,16 @@ perform_backup() {
                 log_message "Backup: $file"
             fi
         fi
-        
-        # Progres la fiecare 100 de fișiere
+
         if (( file_count % 100 == 0 )); then
             log_message "Procesate: $file_count fișiere, backup: $backed_up_count"
         fi
-        
-    done < <(find "$SOURCE_DIR" -type f -print0)
-    
+
+    done < <(find "$SOURCE_DIR" -type f "${EXCLUDE_ARGS[@]}" -print0)
+
     log_message "Backup finalizat: $backed_up_count/$file_count fișiere"
 }
+
 
 create_archive() {
     if [ "$CREATE_ARCHIVE" = "true" ]; then
@@ -166,9 +226,17 @@ create_archive() {
         fi
     fi
 }
-
 encrypt_backup() {
-    if [ "$ENCRYPT_BACKUP" = "true" ] && [ -n "$ENCRYPTION_PASSWORD" ]; then
+    if [ "$ENCRYPT_BACKUP" = "true" ]; then
+        # Dacă parola nu e setată, o cerem de la utilizator
+        if [ -z "$ENCRYPTION_PASSWORD" ]; then
+            log_message "⚠️ Variabila ENCRYPTION_PASSWORD este goală. Cer parola din terminal..."
+            read -s -p "Introduceți parola pentru criptarea backup-ului: " ENCRYPTION_PASSWORD
+            echo
+        else
+            log_message "✅ Parola pentru criptare a fost primită din mediul extern."
+        fi
+
         log_message "Criptez backup-ul..."
         if [ -f "$BACKUP_DIR/backup_$TIMESTAMP.tar.gz" ]; then
             openssl aes-256-cbc -salt -in "$BACKUP_DIR/backup_$TIMESTAMP.tar.gz" \
@@ -179,6 +247,23 @@ encrypt_backup() {
                 rm "$BACKUP_DIR/backup_$TIMESTAMP.tar.gz"
             else
                 log_message "Eroare la criptarea backup-ului!"
+            fi
+        fi
+    fi
+}
+
+verify_encrypted_backup() {
+    if [ "$ENCRYPT_BACKUP" = "true" ]; then
+        local encrypted_file="$BACKUP_DIR/backup_$TIMESTAMP.tar.gz.enc"
+
+        if [ -f "$encrypted_file" ]; then
+            log_message "Verific backup-ul criptat..."
+
+            # Tentaivă de decriptare și listare conținut
+            if openssl aes-256-cbc -d -in "$encrypted_file" -k "$ENCRYPTION_PASSWORD" -out - 2>/dev/null | tar -tzf - &>/dev/null; then
+                log_message "✅ Verificare reușită: Backup-ul criptat este valid."
+            else
+                log_message "❌ Eroare: Backup-ul criptat nu a putut fi verificat! Poate fi corupt sau parola este greșită."
             fi
         fi
     fi
@@ -217,8 +302,10 @@ main() {
     # Execut procesul de backup
     create_backup_structure
     perform_backup
+    verify_backup "$CURRENT_BACKUP"
     create_archive
     encrypt_backup
+    verify_encrypted_backup
     cleanup_old_backups
     
     log_message "=== Backup finalizat cu succes ==="
