@@ -104,16 +104,3 @@ Verificarea se face automat după backup și manual din meniu. Se compară check
 La fiecare rulare, sunt salvate doar fișierele care:
 - s-au modificat (detectat prin checksum),
 - sau nu existau anterior.
-
----
-
-## 🧪 Cerințe
-
-- Linux cu `bash`, `zenity`, `tar`, `openssl`
-- Opțional: `cron` pentru rulare automată
-
----
-
-## 🧠 Autor
-
-Realizat ca temă practică pentru disciplina "Administrarea sistemelor Linux" / "Sisteme de operare".
